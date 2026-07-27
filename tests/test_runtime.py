@@ -14,12 +14,10 @@
 
 from unittest.mock import MagicMock, patch
 
-import jupyter_kernel_client
-
 from colab_cli.runtime import ColabRuntime
 
 
-@patch("colab_cli.runtime.jupyter_kernel_client.KernelClient")
+@patch("colab_cli.runtime.jupyter_kernel_client.WSKernelClient")
 def test_colab_runtime_kernel_client(mock_kc_cls):
     mock_kc = mock_kc_cls.return_value
 
@@ -34,7 +32,6 @@ def test_colab_runtime_kernel_client(mock_kc_cls):
         token="token123",
         kernel_id=None,
         client_kwargs={
-            "subprotocol": jupyter_kernel_client.JupyterSubprotocol.DEFAULT,
             "extra_params": {"colab-runtime-proxy-token": "token123"},
         },
         headers={

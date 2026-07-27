@@ -19,6 +19,7 @@ import queue
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlencode, urljoin
 
@@ -39,7 +40,7 @@ def _make_header(msg_type: str, session: str) -> Dict[str, Any]:
         "msg_id": _new_msg_id(),
         "session": session,
         "username": DEFAULT_USERNAME,
-        "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "date": datetime.now(timezone.utc).isoformat(),
         "msg_type": msg_type,
         "version": PROTOCOL_VERSION,
     }
@@ -83,6 +84,9 @@ class WSKernelClient:
         self.session_id = None
         if client_kwargs and client_kwargs.get("session"):
             self.session_id = client_kwargs["session"]
+        self.extra_params = dict(
+            (client_kwargs or {}).get("extra_params", {})
+        )
         self.extra_headers = headers or {}
         self._own_kernel = True
 
@@ -121,6 +125,10 @@ class WSKernelClient:
         self._ws = websocket.create_connection(
             ws_url, header=headers, timeout=timeout
         )
+        # The timeout above bounds only the handshake. Leaving it on the
+        # connected socket would kill an otherwise healthy REPL/console after
+        # 60 seconds without a kernel message.
+        self._ws.settimeout(None)
         self._stop_flag.clear()
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
@@ -132,7 +140,13 @@ class WSKernelClient:
         url = urljoin(self.server_url + "/", "api/kernels")
         headers = dict(self.extra_headers)
         headers["Authorization"] = f"token {self.token}"
-        resp = requests.post(url, headers=headers, json={}, timeout=timeout)
+        resp = requests.post(
+            url,
+            headers=headers,
+            params=self.extra_params,
+            json={},
+            timeout=timeout,
+        )
         if not resp.ok:
             raise KernelStartError(
                 f"Failed to start kernel: {resp.status_code} {resp.text}"
@@ -143,7 +157,7 @@ class WSKernelClient:
         base = self.server_url.replace("https://", "wss://").replace(
             "http://", "ws://"
         )
-        params = {"session_id": self.session_id}
+        params = {"session_id": self.session_id, **self.extra_params}
         return urljoin(
             base + "/", f"api/kernels/{self.id}/channels?{urlencode(params)}"
         )
@@ -164,14 +178,25 @@ class WSKernelClient:
         headers = dict(self.extra_headers)
         headers["Authorization"] = f"token {self.token}"
         try:
-            requests.delete(url, headers=headers, timeout=10)
+            requests.delete(
+                url, headers=headers, params=self.extra_params, timeout=10
+            )
         except Exception:
             logger.debug("Failed to delete kernel on shutdown", exc_info=True)
 
     # -- message plumbing -----------------------------------------------
 
-    def _send(self, channel: str, msg_type: str, content: Dict[str, Any]) -> str:
+    def _send(
+        self,
+        channel: str,
+        msg_type: str,
+        content: Dict[str, Any],
+        *,
+        msg_id: Optional[str] = None,
+    ) -> str:
         header = _make_header(msg_type, self.session_id)
+        if msg_id is not None:
+            header["msg_id"] = msg_id
         msg = {
             "header": header,
             "parent_header": {},
@@ -247,11 +272,26 @@ class WSKernelClient:
         timeout: float = 10.0,
     ) -> Dict[str, Any]:
         outputs: List[Dict[str, Any]] = []
+        clear_pending = False
+
+        def collect_output(output: Dict[str, Any]):
+            nonlocal clear_pending
+            if output.get("output_type") == "clear_output":
+                if output.get("wait"):
+                    clear_pending = True
+                else:
+                    outputs.clear()
+                return
+            if clear_pending:
+                outputs.clear()
+                clear_pending = False
+            outputs.append(output)
+
         reply = self._execute_common(
             code,
             allow_stdin=allow_stdin,
             stdin_hook=stdin_hook,
-            output_hook=lambda o: outputs.append(o),
+            output_hook=collect_output,
             timeout=timeout,
         )
         reply = dict(reply or {})
@@ -291,8 +331,10 @@ class WSKernelClient:
             "allow_stdin": allow_stdin,
             "stop_on_error": True,
         }
-        msg_id = self._send("shell", "execute_request", content)
-
+        # Register every waiter before sending. A fast kernel can reply from
+        # inside WebSocket.send(), and registering afterward loses iopub/idle
+        # messages and turns a successful execution into a timeout.
+        msg_id = _new_msg_id()
         iopub_q: "queue.Queue[dict]" = queue.Queue()
         self._iopub_queues[msg_id] = iopub_q
         shell_ev = threading.Event()
@@ -300,17 +342,18 @@ class WSKernelClient:
         stdin_q: "queue.Queue[dict]" = queue.Queue()
         self._stdin_waiters[msg_id] = stdin_q
 
-        deadline = time.time() + timeout if timeout else None
+        last_activity = time.monotonic()
         got_idle = False
 
         try:
+            self._send("shell", "execute_request", content, msg_id=msg_id)
             while not got_idle:
                 remaining = None
-                if deadline is not None:
-                    remaining = deadline - time.time()
+                if timeout:
+                    remaining = timeout - (time.monotonic() - last_activity)
                     if remaining <= 0:
                         raise TimeoutError(
-                            f"Execution timed out after {timeout}s"
+                            f"Execution had no activity for {timeout}s"
                         )
 
                 # Check stdin requests (non-blocking-ish)
@@ -326,13 +369,12 @@ class WSKernelClient:
                         )
                     else:
                         value = ""
-                    reply_id = self._send(
+                    self._send(
                         "stdin", "input_reply", {"value": value, "password": password}
                     )
-                    # extend deadline a bit — user interaction shouldn't be
-                    # counted against the execution timeout
-                    if deadline is not None:
-                        deadline = time.time() + timeout
+                    # Timeout is an inactivity ceiling, so stdin activity
+                    # starts a fresh interval.
+                    last_activity = time.monotonic()
                 except queue.Empty:
                     pass
 
@@ -341,6 +383,7 @@ class WSKernelClient:
                 except queue.Empty:
                     continue
 
+                last_activity = time.monotonic()
                 if item.get("__idle__"):
                     got_idle = True
                     break
@@ -364,7 +407,12 @@ class WSKernelClient:
         url = urljoin(self.server_url + "/", f"api/kernels/{self.id}/restart")
         headers = dict(self.extra_headers)
         headers["Authorization"] = f"token {self.token}"
-        resp = requests.post(url, headers=headers, timeout=timeout or 30)
+        resp = requests.post(
+            url,
+            headers=headers,
+            params=self.extra_params,
+            timeout=timeout or 30,
+        )
         if not resp.ok:
             raise KernelStartError(
                 f"Failed to restart kernel: {resp.status_code} {resp.text}"
@@ -420,7 +468,14 @@ class _SocketShim:
 class _SessionShim:
     def __init__(self, ws_client: WSKernelClient):
         self._ws_client = ws_client
-        self.session = ws_client.session_id
+
+    @property
+    def session(self):
+        return self._ws_client.session_id
+
+    @session.setter
+    def session(self, value):
+        self._ws_client.session_id = value
 
     def msg(self, msg_type: str, content: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -464,12 +519,18 @@ def _iopub_to_output(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "name": content.get("name", "stdout"),
             "text": content.get("text", ""),
         }
-    if msg_type in ("execute_result", "display_data"):
-        return {
+    if msg_type in ("execute_result", "display_data", "update_display_data"):
+        output = {
             "output_type": msg_type,
             "data": content.get("data", {}),
             "metadata": content.get("metadata", {}),
         }
+        if msg_type == "execute_result":
+            output["execution_count"] = content.get("execution_count")
+        if msg_type == "update_display_data":
+            output["output_type"] = "display_data"
+            output["transient"] = content.get("transient", {})
+        return output
     if msg_type == "error":
         return {
             "output_type": "error",
@@ -477,5 +538,10 @@ def _iopub_to_output(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "evalue": content.get("evalue", ""),
             "traceback": content.get("traceback", []),
         }
-    # status, execute_input, clear_output, etc. — not surfaced as an output
+    if msg_type == "clear_output":
+        return {
+            "output_type": "clear_output",
+            "wait": bool(content.get("wait", False)),
+        }
+    # status, execute_input, etc. — not surfaced as an output
     return None

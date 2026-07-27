@@ -7,7 +7,10 @@ Designed to support seamless developer productivity, headless automation, and AI
 [Demo](https://github.com/user-attachments/assets/656226a9-af13-4fdb-8eda-d7de747336a2)
 
 > [!NOTE]
-> **Platform support:** the Colab CLI currently supports **Linux and macOS** only. Windows is not supported at this time.
+> **Platform support:** the upstream CLI supports **Linux and macOS**. This
+> Android build also supports **Termux/aarch64** through pure-Python
+> replacements for the dependencies that otherwise require Rust wheels.
+> Windows is not supported at this time.
 
 > [!TIP]
 > Looking for in-notebook, interactive agent-assisted coding instead of a terminal workflow? See the [Colab MCP Server](https://github.com/googlecolab/colab-mcp).
@@ -35,6 +38,12 @@ uv tool install google-colab-cli
 
 # Using pip
 pip install google-colab-cli
+```
+
+For a local source checkout on Termux:
+
+```bash
+pip install . --break-system-packages
 ```
 
 ---

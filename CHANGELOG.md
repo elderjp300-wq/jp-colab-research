@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The package version is derived from the git tag via `hatch-vcs`; each release
 below corresponds to a tag of the same name.
 
+## [Unreleased]
+
+### Fixed
+
+- **Android/Termux:** completed the pure-Python replacements for Pydantic,
+  nbformat, and jupyter-kernel-client without pulling `pydantic-core` or
+  `rpds-py`; constrain google-auth to the compatible 2.47 line before
+  cryptography became a mandatory Rust/OpenSSL dependency.
+- **kernel execution:** register message queues before sending, retain
+  server-created session IDs, preserve runtime-proxy query parameters, and
+  interpret execution timeout as an inactivity limit.
+- **notebooks:** restore recursive NotebookNode-style attribute access,
+  preserve unknown v4 fields, emit cell IDs, and fix history export.
+- **validation:** reject invalid `None`, boolean, list, and tuple values; copy
+  mutable defaults safely; and provide `model_copy`.
+
 ## [0.6.0] - 2026-06-16
 
 ### Changed

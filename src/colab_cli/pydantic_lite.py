@@ -17,19 +17,29 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, fields as dc_fields, MISSING
+import copy
+import types
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union, get_args, get_origin
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 
 class ValidationError(Exception):
     def __init__(self, message: str, model: str = ""):
         super().__init__(message)
         self.model = model
-
-
-_UNSET = object()
 
 
 def Field(default: Any = ..., *, alias: Optional[str] = None, **_kwargs):
@@ -65,11 +75,11 @@ class BaseModel:
             if lookup_key in data:
                 raw_value = data[lookup_key]
             elif field_info is not None and field_info.default is not ...:
-                raw_value = field_info.default
+                raw_value = copy.deepcopy(field_info.default)
             elif hasattr(type(self), py_name) and not isinstance(
                 getattr(type(self), py_name), _FieldInfo
             ):
-                raw_value = getattr(type(self), py_name)
+                raw_value = copy.deepcopy(getattr(type(self), py_name))
             else:
                 raise ValidationError(
                     f"{type(self).__name__}: missing required field "
@@ -87,7 +97,17 @@ class BaseModel:
     def _collect_annotations(cls) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for klass in reversed(cls.__mro__):
-            out.update(getattr(klass, "__annotations__", {}))
+            annotations = getattr(klass, "__annotations__", {})
+            if not annotations:
+                continue
+            try:
+                annotations = get_type_hints(klass)
+            except (NameError, TypeError):
+                # The concrete project models do not contain unresolved
+                # forward references, but keeping the raw annotations is a
+                # useful fallback for third-party callers.
+                pass
+            out.update(annotations)
         return out
 
     @classmethod
@@ -96,8 +116,15 @@ class BaseModel:
         return val if isinstance(val, _FieldInfo) else None
 
     @classmethod
-    def model_validate(cls, data: Dict[str, Any]) -> "BaseModel":
-        return cls(**data)
+    def model_validate(cls, data: Any) -> "BaseModel":
+        if isinstance(data, cls):
+            return data
+        if not isinstance(data, Mapping):
+            raise ValidationError(
+                f"{cls.__name__}: expected a mapping, got {type(data).__name__}",
+                model=cls.__name__,
+            )
+        return cls(**dict(data))
 
     def model_dump(self) -> Dict[str, Any]:
         out = {}
@@ -109,11 +136,27 @@ class BaseModel:
     def model_dump_json(self, indent: Optional[int] = None) -> str:
         return json.dumps(self.model_dump(), indent=indent, default=str)
 
+    def model_copy(
+        self, *, update: Optional[Dict[str, Any]] = None, deep: bool = False
+    ) -> "BaseModel":
+        values = {
+            name: copy.deepcopy(getattr(self, name))
+            if deep
+            else getattr(self, name)
+            for name in self._collect_annotations()
+        }
+        if update:
+            values.update(update)
+        return type(self)(**values)
+
     def __repr__(self):
         fields_str = ", ".join(
             f"{k}={getattr(self, k)!r}" for k in self._collect_annotations()
         )
         return f"{type(self).__name__}({fields_str})"
+
+    def __eq__(self, other: Any) -> bool:
+        return type(self) is type(other) and self.model_dump() == other.model_dump()
 
 
 def _dump_value(val: Any) -> Any:
@@ -138,14 +181,17 @@ def _coerce(value: Any, target_type: Any) -> Any:
     bool, Enum subclasses, BaseModel subclasses, Optional[...], List[...],
     Tuple[...], and plain passthroughs.
     """
-    if value is None:
-        return None
-
     origin = get_origin(target_type)
 
+    if target_type in (Any, object):
+        return value
+
     # Optional[X] / Union[X, None] / Union[A, B]
-    if origin is Union:
-        args = [a for a in get_args(target_type) if a is not type(None)]
+    if origin in (Union, types.UnionType):
+        union_args = get_args(target_type)
+        if value is None and type(None) in union_args:
+            return None
+        args = [a for a in union_args if a is not type(None)]
         if len(args) == 1:
             return _coerce(value, args[0])
         # Multi-type union (e.g. Union[GetAssignmentResponse, Assignment]):
@@ -162,17 +208,43 @@ def _coerce(value: Any, target_type: Any) -> Any:
             f"Value did not match any type in {target_type}: {last_err}"
         )
 
+    if value is None:
+        raise ValidationError(f"None is not valid for {target_type}")
+
     if origin in (list, List):
+        if not isinstance(value, (list, tuple, set)):
+            raise ValidationError(
+                f"Expected a list-like value, got {type(value).__name__}"
+            )
         (item_type,) = get_args(target_type) or (Any,)
         return [_coerce(v, item_type) for v in value]
 
     if origin in (tuple, Tuple):
+        if not isinstance(value, (list, tuple)):
+            raise ValidationError(
+                f"Expected a tuple-like value, got {type(value).__name__}"
+            )
         item_types = get_args(target_type)
         if not item_types:
             return tuple(value)
-        return tuple(
-            _coerce(v, t) for v, t in zip(value, item_types)
-        )
+        if len(item_types) == 2 and item_types[1] is Ellipsis:
+            return tuple(_coerce(v, item_types[0]) for v in value)
+        if len(value) != len(item_types):
+            raise ValidationError(
+                f"Expected tuple of length {len(item_types)}, got {len(value)}"
+            )
+        return tuple(_coerce(v, t) for v, t in zip(value, item_types))
+
+    if origin in (dict, Dict):
+        if not isinstance(value, Mapping):
+            raise ValidationError(
+                f"Expected a mapping, got {type(value).__name__}"
+            )
+        key_type, value_type = get_args(target_type) or (Any, Any)
+        return {
+            _coerce(k, key_type): _coerce(v, value_type)
+            for k, v in value.items()
+        }
 
     if isinstance(target_type, type) and issubclass(target_type, BaseModel):
         if isinstance(value, target_type):
@@ -196,13 +268,49 @@ def _coerce(value: Any, target_type: Any) -> Any:
             return datetime.fromisoformat(value)
         raise ValidationError(f"Cannot coerce {value!r} into datetime")
 
-    if target_type in (str, int, float, bool):
-        if isinstance(value, target_type):
+    if target_type is bool:
+        if isinstance(value, bool):
             return value
-        try:
-            return target_type(value)
-        except (TypeError, ValueError):
-            raise ValidationError(f"Cannot coerce {value!r} into {target_type}")
+        if value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        raise ValidationError(f"Cannot coerce {value!r} into bool")
+
+    if target_type is str:
+        if isinstance(value, str):
+            return value
+        raise ValidationError(f"Cannot coerce {value!r} into str")
+
+    if target_type is int:
+        if isinstance(value, bool):
+            raise ValidationError(f"Cannot coerce {value!r} into int")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value.strip())
+            except ValueError:
+                pass
+        raise ValidationError(f"Cannot coerce {value!r} into int")
+
+    if target_type is float:
+        if isinstance(value, bool):
+            raise ValidationError(f"Cannot coerce {value!r} into float")
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                pass
+        raise ValidationError(f"Cannot coerce {value!r} into float")
 
     # Any / unrecognized typing construct / plain object: passthrough
     return value

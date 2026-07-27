@@ -25,7 +25,9 @@ classifiers = [
 dependencies = [
     "click>=8.0",
     "filelock>=3.29.2",
-    "google-auth>=2.49.1",
+    # 2.48 made cryptography (Rust/OpenSSL) a mandatory dependency. The CLI
+    # only uses stable auth/credentials APIs already present in 2.47.x.
+    "google-auth>=2.47,<2.48",
     "google-auth-oauthlib>=1.3.0",
     "html2text>=2024.2.26",
     # jupyter-kernel-client and nbformat removed: replaced by
@@ -74,9 +76,6 @@ package = true
 
 [[tool.uv.index]]
 url = "https://pypi.org/simple"
-
-[tool.uv.sources]
-jupyter-kernel-client = { git = "https://github.com/googlecolab/jupyter-kernel-client.git" }
 
 [dependency-groups]
 dev = [

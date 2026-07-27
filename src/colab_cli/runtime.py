@@ -152,9 +152,9 @@ class ColabRuntime:
     ) -> List[Dict[str, Any]]:
         # ``jupyter_kernel_client`` defaults ``timeout`` to ``REQUEST_TIMEOUT``
         # (10 seconds) on both ``execute`` and ``execute_interactive``. That
-        # value is a wall-clock budget that shrinks every time the poll loop
-        # iterates -- as long as iopub/stdin events arrive back-to-back the
-        # call survives, but a single >10s quiet stretch (e.g. a kernel
+        # value is an inactivity ceiling -- as long as iopub/stdin events
+        # keep arriving the call survives, but a single >10s quiet stretch
+        # (e.g. a kernel
         # blocked on ``input_request`` while the user OAuths in the browser)
         # will raise ``TimeoutError`` even though the underlying execution is
         # still healthy. Callers that know they need a longer ceiling can
@@ -189,8 +189,19 @@ class ColabRuntime:
             # buffered raw messages and re-derived new outputs each time;
             # our WSKernelClient converts and emits directly).
             outputs = []
+            clear_pending = False
 
             def wrapped_output_hook(out):
+                nonlocal clear_pending
+                if out.get("output_type") == "clear_output":
+                    if out.get("wait"):
+                        clear_pending = True
+                    else:
+                        outputs.clear()
+                    return
+                if clear_pending:
+                    outputs.clear()
+                    clear_pending = False
                 outputs.append(out)
                 output_hook(out)
 

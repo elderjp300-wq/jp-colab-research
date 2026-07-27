@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import nbformat
 import os
 import pytest
 import shutil
@@ -21,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock, ANY
+from colab_cli import ipynb_lite as nbformat
 from colab_cli.cli import main
 
 
